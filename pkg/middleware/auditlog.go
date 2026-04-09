@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/grafana/grafana/pkg/infra/log"
-	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
+	"github.com/grafana/grafana/pkg/services/contexthandler"
 	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/web"
 )
@@ -54,18 +54,18 @@ func DefaultAuditLogConfig() AuditLogConfig {
 
 var auditLogger = log.New("audit")
 
-// AuditLog returns a web.Handler that writes a structured audit log entry for
-// each request that matches the configured methods and paths.
+// AuditLog returns a web.Middleware that writes a structured audit log entry
+// for each request that matches the configured methods and paths.
 //
-// The handler must be placed after the context handler so that user identity
+// The middleware must be placed after the context handler so that user identity
 // is available on the request context.
 //
 // Example:
 //
-//	router.Use(middleware.AuditLog(cfg, middleware.DefaultAuditLogConfig()))
-func AuditLog(cfg *setting.Cfg, acfg AuditLogConfig) web.Handler {
+//	router.UseMiddleware(middleware.AuditLog(cfg, middleware.DefaultAuditLogConfig()))
+func AuditLog(_ *setting.Cfg, acfg AuditLogConfig) web.Middleware {
 	if !acfg.Enabled {
-		return func(_ *contextmodel.ReqContext) {}
+		return func(next http.Handler) http.Handler { return next }
 	}
 
 	methodSet := make(map[string]struct{}, len(acfg.AuditMethods))
@@ -73,70 +73,76 @@ func AuditLog(cfg *setting.Cfg, acfg AuditLogConfig) web.Handler {
 		methodSet[strings.ToUpper(m)] = struct{}{}
 	}
 
-	return func(c *contextmodel.ReqContext) {
-		path := c.Req.URL.Path
-		method := strings.ToUpper(c.Req.Method)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			method := strings.ToUpper(r.Method)
 
-		// Skip paths take priority over audit paths
-		for _, skip := range acfg.SkipPaths {
-			if strings.HasPrefix(path, skip) {
+			if !shouldAudit(path, method, methodSet, acfg) {
+				next.ServeHTTP(w, r)
 				return
 			}
-		}
 
-		// Check if method is auditable
-		if _, ok := methodSet[method]; !ok {
-			return
-		}
+			rw := web.Rw(w, r)
+			start := time.Now()
+			next.ServeHTTP(rw, r)
+			duration := time.Since(start)
 
-		// Check if path falls under an audited prefix
-		audited := len(acfg.AuditPaths) == 0
-		for _, ap := range acfg.AuditPaths {
-			if strings.HasPrefix(path, ap) {
-				audited = true
-				break
+			status := rw.Status()
+
+			var userID, orgID int64
+			var userLogin, remoteAddr string
+			if c := contexthandler.FromContext(r.Context()); c != nil {
+				remoteAddr = c.RemoteAddr()
+				if c.SignedInUser != nil {
+					userID = c.SignedInUser.UserID
+					orgID = c.SignedInUser.OrgID
+					userLogin = c.SignedInUser.Login
+				}
 			}
-		}
-		if !audited {
-			return
-		}
 
-		start := time.Now()
-		// Response is written by the next handler in chain; we log after.
-		// Note: there is no explicit hook here — duration only includes
-		// time up to when the audit log entry is written, not full response time.
-		duration := time.Since(start)
+			fields := []any{
+				"method", method,
+				"path", path,
+				"status", status,
+				"duration_ms", duration.Milliseconds(),
+				"remote_addr", remoteAddr,
+				"user_id", userID,
+				"org_id", orgID,
+				"user_login", userLogin,
+			}
 
-		userID := int64(0)
-		orgID := int64(0)
-		userLogin := ""
-		if c.SignedInUser != nil {
-			userID = c.SignedInUser.UserID
-			orgID = c.SignedInUser.OrgID
-			userLogin = c.SignedInUser.Login
-		}
+			if r.URL.RawQuery != "" {
+				fields = append(fields, "query", r.URL.RawQuery)
+			}
 
-		status := c.Resp.Status()
-		fields := []any{
-			"method", method,
-			"path", path,
-			"status", status,
-			"duration_ms", duration.Milliseconds(),
-			"remote_addr", c.RemoteAddr(),
-			"user_id", userID,
-			"org_id", orgID,
-			"user_login", userLogin,
-		}
+			if status >= http.StatusBadRequest {
+				auditLogger.Warn("audit", fields...)
+			} else {
+				auditLogger.Info("audit", fields...)
+			}
+		})
+	}
+}
 
-		if c.Req.URL.RawQuery != "" {
-			fields = append(fields, "query", c.Req.URL.RawQuery)
-		}
-
-		// Log at warn level for non-2xx responses so they stand out
-		if status >= http.StatusBadRequest {
-			auditLogger.Warn("audit", fields...)
-		} else {
-			auditLogger.Info("audit", fields...)
+func shouldAudit(path, method string, methodSet map[string]struct{}, acfg AuditLogConfig) bool {
+	for _, skip := range acfg.SkipPaths {
+		if strings.HasPrefix(path, skip) {
+			return false
 		}
 	}
+
+	if _, ok := methodSet[method]; !ok {
+		return false
+	}
+
+	if len(acfg.AuditPaths) == 0 {
+		return true
+	}
+	for _, ap := range acfg.AuditPaths {
+		if strings.HasPrefix(path, ap) {
+			return true
+		}
+	}
+	return false
 }
