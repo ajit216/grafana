@@ -11,6 +11,11 @@ import (
 	"github.com/grafana/grafana/pkg/web"
 )
 
+const (
+	defaultMaxIPs        = 131072
+	defaultSweepInterval = 30 * time.Second
+)
+
 // RateLimiterConfig configures the per-IP sliding window rate limiter.
 type RateLimiterConfig struct {
 	// Enabled controls whether rate limiting is active.
@@ -28,6 +33,15 @@ type RateLimiterConfig struct {
 	// TrustProxy controls whether X-Forwarded-For / X-Real-IP headers are
 	// trusted for IP extraction. Enable only when behind a known proxy.
 	TrustProxy bool
+
+	// MaxIPs caps the number of tracked IPs. When the limit is reached, new
+	// IPs are rate-limited until the background sweep evicts stale entries.
+	// Zero uses the default (131072).
+	MaxIPs int
+
+	// SweepInterval controls how often the background goroutine removes
+	// expired buckets. Zero uses the default (30s).
+	SweepInterval time.Duration
 }
 
 // DefaultRateLimiterConfig returns a permissive default suitable for development.
@@ -50,12 +64,14 @@ type ipBucket struct {
 
 // RateLimiter holds per-IP state for the sliding window rate limiter.
 type RateLimiter struct {
-	cfg  RateLimiterConfig
-	mu   sync.Mutex
-	ips  map[string]*ipBucket
+	cfg    RateLimiterConfig
+	mu     sync.Mutex
+	ips    map[string]*ipBucket
+	stopCh chan struct{}
 }
 
-// NewRateLimiter constructs a RateLimiter from cfg. Panics if Requests or
+// NewRateLimiter constructs a RateLimiter from cfg and starts a background
+// sweep goroutine. Call Stop() to release resources. Panics if Requests or
 // Window are non-positive.
 func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 	if cfg.Requests <= 0 {
@@ -64,9 +80,60 @@ func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 	if cfg.Window <= 0 {
 		panic("ratelimiter: Window must be positive")
 	}
-	return &RateLimiter{
-		cfg: cfg,
-		ips: make(map[string]*ipBucket),
+	if cfg.MaxIPs <= 0 {
+		cfg.MaxIPs = defaultMaxIPs
+	}
+	if cfg.SweepInterval <= 0 {
+		cfg.SweepInterval = defaultSweepInterval
+	}
+	rl := &RateLimiter{
+		cfg:    cfg,
+		ips:    make(map[string]*ipBucket),
+		stopCh: make(chan struct{}),
+	}
+	go rl.sweepLoop()
+	return rl
+}
+
+// Stop terminates the background sweep goroutine.
+func (rl *RateLimiter) Stop() {
+	close(rl.stopCh)
+}
+
+func (rl *RateLimiter) sweepLoop() {
+	ticker := time.NewTicker(rl.cfg.SweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-rl.stopCh:
+			return
+		case <-ticker.C:
+			rl.sweep()
+		}
+	}
+}
+
+func (rl *RateLimiter) sweep() {
+	now := time.Now()
+	cutoff := now.Add(-rl.cfg.Window)
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	for ip, bucket := range rl.ips {
+		bucket.mu.Lock()
+		hasActive := false
+		for _, ts := range bucket.timestamps {
+			if ts.After(cutoff) {
+				hasActive = true
+				break
+			}
+		}
+		bucket.mu.Unlock()
+
+		if !hasActive {
+			delete(rl.ips, ip)
+		}
 	}
 }
 
@@ -101,6 +168,10 @@ func (rl *RateLimiter) allow(ip string) bool {
 	rl.mu.Lock()
 	bucket, ok := rl.ips[ip]
 	if !ok {
+		if len(rl.ips) >= rl.cfg.MaxIPs {
+			rl.mu.Unlock()
+			return false
+		}
 		bucket = &ipBucket{}
 		rl.ips[ip] = bucket
 	}
