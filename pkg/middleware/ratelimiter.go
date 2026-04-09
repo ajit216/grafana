@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -46,6 +47,7 @@ func DefaultRateLimiterConfig() RateLimiterConfig {
 type ipBucket struct {
 	mu         sync.Mutex
 	timestamps []time.Time
+	lastSeen   time.Time
 }
 
 // RateLimiter holds per-IP state for the sliding window rate limiter.
@@ -112,6 +114,8 @@ func (rl *RateLimiter) allow(ip string) bool {
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
+	bucket.lastSeen = now
+
 	// Evict timestamps outside the window
 	valid := bucket.timestamps[:0]
 	for _, ts := range bucket.timestamps {
@@ -159,4 +163,37 @@ func (rl *RateLimiter) Reset() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	rl.ips = make(map[string]*ipBucket)
+}
+
+// StartEviction launches a background goroutine that periodically removes IP
+// buckets that have had no traffic within the last window duration. This
+// prevents the ips map from growing without bound in long-running servers.
+// The goroutine stops when ctx is cancelled.
+func (rl *RateLimiter) StartEviction(ctx context.Context, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				rl.evict()
+			}
+		}
+	}()
+}
+
+// evict removes IP buckets that have not seen traffic within the last window.
+func (rl *RateLimiter) evict() {
+	cutoff := time.Now().Add(-rl.cfg.Window)
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for ip, b := range rl.ips {
+		b.mu.Lock()
+		if b.lastSeen.Before(cutoff) {
+			delete(rl.ips, ip)
+		}
+		b.mu.Unlock()
+	}
 }

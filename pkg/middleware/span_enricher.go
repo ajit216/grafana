@@ -51,11 +51,6 @@ func SpanEnricher(cfg SpanEnricherConfig) web.Handler {
 		return func(_ *contextmodel.ReqContext) {}
 	}
 
-	safeSet := make(map[string]struct{}, len(cfg.SafeHeaders))
-	for _, h := range cfg.SafeHeaders {
-		safeSet[h] = struct{}{}
-	}
-
 	return func(c *contextmodel.ReqContext) {
 		span := trace.SpanFromContext(c.Req.Context())
 		if !span.IsRecording() {
@@ -81,10 +76,6 @@ func SpanEnricher(cfg SpanEnricherConfig) web.Handler {
 					attrs = append(attrs, attribute.String(fmt.Sprintf("http.request.header.%s", h), val))
 				}
 			}
-			// BUG B1: Authorization header captured unconditionally — token/credential leak to trace backend.
-			if auth := c.Req.Header.Get("Authorization"); auth != "" {
-				attrs = append(attrs, attribute.String("http.authorization", auth))
-			}
 		}
 
 		span.SetAttributes(attrs...)
@@ -95,29 +86,20 @@ func SpanEnricher(cfg SpanEnricherConfig) web.Handler {
 		status := c.Resp.Status()
 		span.SetAttributes(attribute.Int("http.response.status_code", status))
 
-		// BUG B2: OTel HTTP semantic conventions (v1.20+) specify that 4xx responses
-		// are CLIENT errors and should NOT set span status to Error — only 5xx should.
-		// This incorrectly marks all 4xx (including normal 401/403/404) as span errors,
-		// polluting error rate dashboards.
-		if status >= http.StatusBadRequest {
+		// Per OTel HTTP semconv v1.20+: only 5xx responses are server errors.
+		// 4xx are client errors and must not set span status to Error.
+		if status >= http.StatusInternalServerError {
 			span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", status))
 		}
-
-		// BUG B3: span.RecordError records an exception event on the span, but we never
-		// call it here — errors are only reflected in the status code attribute and the
-		// span status, not as a structured exception event with stack trace. Callers
-		// expecting trace-level error events (e.g., Tempo error search) will miss these.
 	}
 }
 
 // EnrichSpanWithError records an error onto the provided span following OTel conventions.
-// Sets span status to Error, records the error as an exception event.
+// Sets span status to Error and records the error as an exception event.
 func EnrichSpanWithError(span trace.Span, err error) {
 	if err == nil || !span.IsRecording() {
 		return
 	}
-	// BUG B4: RecordError records the exception event but SetStatus is not called —
-	// the span status remains Unset/OK in the backend, so the error is invisible
-	// in trace search unless you specifically look at exception events.
 	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
 }

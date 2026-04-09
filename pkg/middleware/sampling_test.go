@@ -53,12 +53,7 @@ func TestSampler_AlwaysSample(t *testing.T) {
 func TestSampler_NeverSample(t *testing.T) {
 	cfg := SamplerConfig{
 		Enabled: true,
-		// BUG B10: Rate=1.0 is used here but the test is named "NeverSample".
-		// The intent is rate=0.0 (never sample), but 1.0 is used — the test
-		// name and implementation contradict each other. The test always passes
-		// because StatusNoContent is never returned (all requests pass through),
-		// which is the opposite of what "NeverSample" should verify.
-		Rate: 1.0,
+		Rate:    0.0,
 	}
 	s := NewSampler(cfg)
 	handler := s.Middleware()
@@ -66,10 +61,8 @@ func TestSampler_NeverSample(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		c := newSamplerReqContext(t, http.MethodGet, "/api/dashboards")
 		invokeHandler(handler, c)
-		// This assertion is wrong — it checks for StatusNoContent (dropped)
-		// but rate=1.0 means all requests pass through (not dropped).
-		// The test should use rate=0.0 and this assertion would then be correct.
-		assert.NotEqual(t, http.StatusNoContent, c.Resp.Status())
+		assert.Equal(t, http.StatusNoContent, c.Resp.Status(),
+			"rate=0.0 should drop all requests")
 	}
 }
 

@@ -44,38 +44,42 @@ func newEnricherReqContext(t *testing.T, req *http.Request) *contextmodel.ReqCon
 	return c
 }
 
-// TestSpanEnricher_InjectsUserAttributes verifies that user_id, org_id, and role
+// TestSpanEnricher_InjectsUserAttributes verifies that user_id, org_id, login, and role
 // are set on the active span.
 func TestSpanEnricher_InjectsUserAttributes(t *testing.T) {
-	_, tracer := newTestSpanExporter(t)
+	exp, tracer := newTestSpanExporter(t)
 
-	// BUG B9: context.Background() carries no span — trace.SpanFromContext returns
-	// a noopSpan whose IsRecording() is false. The enricher returns early without
-	// setting any attributes. The test never validates actual span data because no
-	// span is ever started, so it always passes regardless of enricher behavior.
-	ctx := context.Background()
+	ctx, span := tracer.Start(context.Background(), "test-span")
 	req := httptest.NewRequest(http.MethodGet, "/api/dashboards", nil)
 	req = req.WithContext(ctx)
-
-	_ = tracer // tracer imported but span never started from it
 
 	cfg := DefaultSpanEnricherConfig()
 	handler := SpanEnricher(cfg)
 
 	c := newEnricherReqContext(t, req)
 	invokeHandler(handler, c)
+	span.End()
 
-	// Passes trivially: enricher returns early (no-op span), nothing asserted on span data.
-	assert.NotNil(t, c.SignedInUser)
+	spans := exp.GetSpans()
+	require.Len(t, spans, 1)
+
+	attrMap := make(map[attribute.Key]attribute.Value)
+	for _, a := range spans[0].Attributes {
+		attrMap[a.Key] = a.Value
+	}
+
+	assert.Equal(t, int64(42), attrMap["grafana.user_id"].AsInt64())
+	assert.Equal(t, int64(7), attrMap["grafana.org_id"].AsInt64())
+	assert.Equal(t, "ajit", attrMap["grafana.user_login"].AsString())
+	assert.Equal(t, "Editor", attrMap["grafana.user_role"].AsString())
 }
 
-// TestSpanEnricher_AuthHeaderLeaked verifies that Authorization headers are NOT
-// captured in span attributes (they should be filtered from SafeHeaders).
-func TestSpanEnricher_AuthHeaderLeaked(t *testing.T) {
+// TestSpanEnricher_AuthHeaderNotLeaked verifies that the Authorization header is
+// never captured as a span attribute (credential leak prevention).
+func TestSpanEnricher_AuthHeaderNotLeaked(t *testing.T) {
 	exp, tracer := newTestSpanExporter(t)
 
 	ctx, span := tracer.Start(context.Background(), "test-span")
-	defer span.End()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/dashboards", nil)
 	req.Header.Set("Authorization", "Bearer secret-token-12345")
@@ -85,26 +89,20 @@ func TestSpanEnricher_AuthHeaderLeaked(t *testing.T) {
 	handler := SpanEnricher(cfg)
 	c := newEnricherReqContext(t, req)
 	invokeHandler(handler, c)
-
 	span.End()
 
 	spans := exp.GetSpans()
 	require.Len(t, spans, 1)
 
-	// This assertion is backwards — it asserts the auth header IS present
-	// (documenting the bug, not guarding against it). A correct test would
-	// assert the attribute is absent.
-	var found bool
 	for _, attr := range spans[0].Attributes {
-		if attr.Key == "http.authorization" {
-			found = true
-		}
+		assert.NotEqual(t, attribute.Key("http.authorization"), attr.Key,
+			"Authorization header must never be captured in spans")
 	}
-	assert.True(t, found, "expected Authorization header to be captured (documents bug B1)")
 }
 
-// TestSpanEnricher_FourxxMarkedAsError checks span status for 4xx responses.
-func TestSpanEnricher_FourxxMarkedAsError(t *testing.T) {
+// TestSpanEnricher_FourxxNotMarkedAsError verifies 4xx responses do NOT set span
+// status to Error per OTel HTTP semconv v1.20+ (only 5xx are server errors).
+func TestSpanEnricher_FourxxNotMarkedAsError(t *testing.T) {
 	exp, tracer := newTestSpanExporter(t)
 
 	ctx, span := tracer.Start(context.Background(), "test-span")
@@ -116,7 +114,6 @@ func TestSpanEnricher_FourxxMarkedAsError(t *testing.T) {
 	handler := SpanEnricher(cfg)
 	c := newEnricherReqContext(t, req)
 
-	// Simulate a 404 response.
 	c.Resp.WriteHeader(http.StatusNotFound)
 	invokeHandler(handler, c)
 	span.End()
@@ -124,16 +121,36 @@ func TestSpanEnricher_FourxxMarkedAsError(t *testing.T) {
 	spans := exp.GetSpans()
 	require.Len(t, spans, 1)
 
-	// BUG B2 surface: OTel semantic conventions say 4xx is a CLIENT error and
-	// should NOT set span status to Error. This test asserts Error is set for 404,
-	// which means it validates the buggy behavior rather than the correct behavior.
-	assert.Equal(t, codes.Error, spans[0].Status.Code,
-		"404 sets span status to Error (see OTel HTTP semconv §status-code)")
+	assert.NotEqual(t, codes.Error, spans[0].Status.Code,
+		"404 is a client error and must not set span status to Error")
 }
 
-// TestEnrichSpanWithError_RecordErrorWithoutStatus verifies that EnrichSpanWithError
-// records an exception event on the span.
-func TestEnrichSpanWithError_RecordErrorWithoutStatus(t *testing.T) {
+// TestSpanEnricher_FivexxMarkedAsError verifies 5xx responses set span status to Error.
+func TestSpanEnricher_FivexxMarkedAsError(t *testing.T) {
+	exp, tracer := newTestSpanExporter(t)
+
+	ctx, span := tracer.Start(context.Background(), "test-span")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/dashboards", nil)
+	req = req.WithContext(ctx)
+
+	cfg := DefaultSpanEnricherConfig()
+	handler := SpanEnricher(cfg)
+	c := newEnricherReqContext(t, req)
+
+	c.Resp.WriteHeader(http.StatusInternalServerError)
+	invokeHandler(handler, c)
+	span.End()
+
+	spans := exp.GetSpans()
+	require.Len(t, spans, 1)
+
+	assert.Equal(t, codes.Error, spans[0].Status.Code,
+		"500 is a server error and must set span status to Error")
+}
+
+// TestEnrichSpanWithError records an exception event and sets span status to Error.
+func TestEnrichSpanWithError(t *testing.T) {
 	exp, tracer := newTestSpanExporter(t)
 
 	ctx, span := tracer.Start(context.Background(), "test-span")
@@ -144,15 +161,7 @@ func TestEnrichSpanWithError_RecordErrorWithoutStatus(t *testing.T) {
 	spans := exp.GetSpans()
 	require.Len(t, spans, 1)
 
-	// Verify exception event was recorded.
 	require.Len(t, spans[0].Events, 1)
 	assert.Equal(t, "exception", spans[0].Events[0].Name)
-
-	// BUG B4 surface: span status should be Error when an error is recorded,
-	// but EnrichSpanWithError never calls SetStatus — status remains Unset.
-	// This assertion documents the bug rather than asserting correct behavior.
-	assert.Equal(t, codes.Unset, spans[0].Status.Code,
-		"status is Unset because SetStatus is never called (bug B4)")
-
-	_ = attribute.String // suppress unused import
+	assert.Equal(t, codes.Error, spans[0].Status.Code)
 }
